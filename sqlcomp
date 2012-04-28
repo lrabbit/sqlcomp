@@ -1,12 +1,12 @@
 #!/bin/sh
 # 2012-01-30: v1.0			first version
 # 2012-01-31: v1.0.1			modified the sed expression in extract_obj_name
-#								stop when a database error is detected (compilation problem)
-#								removed the use of temp files
+#					stop when a database error is detected (compilation problem)
+#					removed the use of temp files
 # 2012-02-06: v1.0.2			add the possibility to disable the logs
 # 2012-02-13: v1.0.3			add support for views and functions
 # 2012-03-01: v1.0.4			add support for tables
-#								minor bug fixes
+#					minor bug fixes
 # 2012-03-05: v1.0.5			add the possibility to disable object dropping
 #
 # TODO
@@ -15,6 +15,22 @@
 # - add the possibility to save the logs in a specified directory instead of .
 # - add support for a ~/.sqlcomp to specify defaults
 # 
+
+#
+# Copyright 2012 Hakim Mazouz
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 PROGNAME=`basename $0`
 PROGVERSION=1.0.5
