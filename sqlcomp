@@ -1,0 +1,554 @@
+#!/bin/sh
+# 2012-01-30: v1.0			first version
+# 2012-01-31: v1.0.1			modified the sed expression in extract_obj_name
+#								stop when a database error is detected (compilation problem)
+#								removed the use of temp files
+# 2012-02-06: v1.0.2			add the possibility to disable the logs
+# 2012-02-13: v1.0.3			add support for views and functions
+# 2012-03-01: v1.0.4			add support for tables
+#								minor bug fixes
+# 2012-03-05: v1.0.5			add the possibility to disable object dropping
+#
+# TODO
+# - add support for .h files (constants...) by using cpp
+# - add a marker in the compiled objects (date / version / user...)
+# - add the possibility to save the logs in a specified directory instead of .
+# - add support for a ~/.sqlcomp to specify defaults
+# 
+
+PROGNAME=`basename $0`
+PROGVERSION=1.0.5
+SQLCMD=sqlcmd
+LOGFILE=${PROGNAME}_`date +%Y%m%d_%H%M%S`.log
+FATAL_ERROR=200
+
+USE_LOG=0
+DROP_OBJECTS=1
+TMPFILES=
+CURR_OBJ=
+CURR_TYPESHORT=
+CURR_TYPELONG=
+DB_SRV=
+DB_USR=
+DB_PWD=
+DB_DATABASE=
+DB_LIST=
+
+function log()
+{
+	if [ $USE_LOG -ne 0 ]
+	then
+		echo "[`date "+%Y-%m-%d %H:%M:%S.%N"`] $1" >> $LOGFILE
+	fi
+}
+
+function log_file()
+{
+	if [ $USE_LOG -ne 0 ]
+	then
+		echo "[`date "+%Y-%m-%d %H:%M:%S.%N"`] Contents of file '$1':" >> $LOGFILE
+		cat "$1" >> $LOGFILE
+	fi
+}
+
+function print_and_log()
+{
+	if [ $USE_LOG -ne 0 ]
+	then
+		echo "[`date "+%Y-%m-%d %H:%M:%S.%N"`] $1" >> $LOGFILE
+	fi
+	
+	echo "$1"
+}
+
+function print_and_log_file()
+{
+	if [ $USE_LOG -ne 0 ]
+	then
+		echo "[`date "+%Y-%m-%d %H:%M:%S.%N"`] Contents of file '$1':" >> $LOGFILE
+		cat "$1" >> $LOGFILE
+	fi
+	
+	cat "$1"
+}
+
+function usage()
+{
+	echo "Usage: "
+	echo "${PROGNAME} -s <server> -u <user> -p <password> [-d <database>] [-l <file list>] [-e] [-n] [<file 1> <file 2> ... <file n>]"
+	echo "  -s: the database server URL"
+	echo "  -u: the database user"
+	echo "  -p: the database password"
+	echo "  -d: the database name"
+	echo "  -l: a list of SQL files to compile"
+	echo "  -e: enable file logs"
+	echo "  -n: disable object dropping"
+	
+	echo ""
+	
+	exit 1
+}
+
+function create_temp_file()
+{
+	TEMP_FILE=`mktemp /tmp/${PROGNAME}.XXXXXX`
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[create_temp_file] ERROR: cannot create temporary file in /tmp"
+		TEMP_FILE=
+		return 1
+	fi
+	
+	# add the created file to the list
+	TMPFILES="${TMPFILES} ${TEMP_FILE}"
+	
+	return 0
+}
+
+function delete_temp_files()
+{
+	for i in ${TMPFILES}
+	do
+		log "[delete_temp_files] Removing temp file '${i}'"
+		rm -f "$i" > /dev/null 2>&1
+	done
+}
+
+function check_database_error()
+{
+	echo "$1" | egrep -i "Msg" > /dev/null 2>&1
+	ret_code=$?
+	
+	if [ $ret_code -eq 0 ]
+	then
+		return 1
+	fi
+	
+	return 0
+}
+
+function check_connection()
+{
+	res=`$SQLCMD -S "${DB_SRV}" -U "${DB_USR}" -P"${DB_PWD}" -Q "set nocount on; select @@version"`
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[check_connection] ERROR: ${SQLCMD} returned ${ret_code}"
+		print_and_log "${res}"
+		return 2
+	fi
+	
+	echo "${res}" | egrep "Microsoft SQL Server" > /dev/null 2>&1
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[check_connection] ERROR: did not find 'Microsoft SQL Server' in the @@version response"
+		print_and_log "${res}"
+		return 3
+	fi
+	
+	return 0
+}
+
+function extract_obj_name()
+{
+	create_line=`egrep -m 1 -i "create[[:space:]]*(procedure|view|function|table)" $1 | tr -d "[]()" | sed 's/^[[:space:]]*[Cc][Rr][Ee][Aa][Tt][Ee][[:space:]]*\([A-Za-z]*\)[[:space:]]*\([A-Za-z0-9\._]*\)[[:space:]]*.*$/\1 \2/'`
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[extract_obj_name] ERROR: cannot extract the object name and type from the given file"
+		CURR_OBJ=
+		CURR_TYPESHORT=
+		return 1
+	fi
+	
+	if [ "x${create_line}" = "x" ]
+	then
+		print_and_log "[extract_obj_name] ERROR: cannot extract the object name and type from the given file"
+		CURR_OBJ=
+		CURR_TYPESHORT=
+		return 2
+	fi
+	
+	CURR_TYPELONG=`echo "${create_line}" | awk '{ print tolower($1); }'`
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[extract_obj_name] ERROR: cannot extract the object type from the extracted line"
+		CURR_OBJ=
+		CURR_TYPESHORT=
+		CURR_TYPELONG=
+		return 3
+	fi
+	
+	if [ "x${CURR_TYPELONG}" = "x" ]
+	then
+		print_and_log "[extract_obj_name] ERROR: cannot extract the object type from the extracted line"
+		CURR_OBJ=
+		CURR_TYPESHORT=
+		CURR_TYPELONG=
+		return 4
+	fi
+	
+	CURR_TYPESHORT=`echo "${CURR_TYPELONG}" | awk '{ switch ($1) { case "procedure": print "P"; break; case "function": print "FN"; break; case "view": print "V"; break; case "table": print "U"; break; default: print ""; }}'`
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[extract_obj_name] ERROR: cannot extract the object type from the extracted line"
+		CURR_OBJ=
+		CURR_TYPESHORT=
+		CURR_TYPELONG=
+		return 5
+	fi
+	
+	if [ "x${CURR_TYPESHORT}" = "x" ]
+	then
+		print_and_log "[extract_obj_name] ERROR: cannot extract the object type from the extracted line"
+		CURR_OBJ=
+		CURR_TYPESHORT=
+		CURR_TYPELONG=
+		return 6
+	fi
+	
+	CURR_OBJ=`echo "${create_line}" | awk '{ print $2; }' | sed 's/[^\.]*\.\(.*\)/\1/'`
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[extract_obj_name] ERROR: cannot extract the object name from the extracted line"
+		CURR_OBJ=
+		CURR_TYPESHORT=
+		CURR_TYPELONG=
+		return 7
+	fi
+	
+	if [ "x${CURR_OBJ}" = "x" ]
+	then
+		print_and_log "[extract_obj_name] ERROR: cannot extract the object name from the extracted line"
+		CURR_OBJ=
+		CURR_TYPESHORT=
+		CURR_TYPELONG=
+		return 8
+	fi
+	
+	return 0
+}
+
+function does_object_exist()
+{
+	query="use ${DB_DATABASE}; set nocount on; if exists (select 1 from sysobjects where type = '$1' and name = '$2') print 'EXISTS' else print 'NOT_EXISTS'"
+	
+	res=`$SQLCMD -S "${DB_SRV}" -U "${DB_USR}" -P"${DB_PWD}" -Q "${query}"`
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[does_object_exist] ERROR: ${SQLCMD} returned ${ret_code}"
+		print_and_log "${res}"
+		return ${FATAL_ERROR}
+	fi
+	
+	check_database_error "${res}"
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[does_object_exist] ERROR: an error occurred while checking the object existence"
+		print_and_log "${res}"
+		return ${FATAL_ERROR}
+	fi
+	
+	exists=0
+	
+	echo "${res}" | egrep "NOT_EXISTS" > /dev/null 2>&1
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		echo "${res}" | egrep "EXISTS" > /dev/null 2>&1
+		ret_code=$?
+		
+		if [ $ret_code -ne 0 ]
+		then
+			print_and_log "[does_object_exist] ERROR: cannot determine whether '$2' exists or not"
+			print_and_log "${res}"
+			return 4
+		else
+			exists=1
+		fi
+	else
+		exists=0
+	fi
+	
+	return $exists
+}
+
+function drop_object()
+{
+	if [ $DROP_OBJECTS -eq 0 ]
+	then
+		return 0
+	fi
+	
+	res=`$SQLCMD -S "${DB_SRV}" -U "${DB_USR}" -P"${DB_PWD}" -Q "use ${DB_DATABASE}; set nocount on; drop $1 $2;"`
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[drop_object] ERROR: ${SQLCMD} returned ${ret_code}"
+		print_and_log "${res}"
+		return 2
+	fi
+	
+	check_database_error "${res}"
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[drop_object] ERROR: an error occurred while dropping the object"
+		print_and_log "${res}"
+		return ${FATAL_ERROR}
+	fi
+	
+	return 0
+}
+
+function compile_object()
+{
+	res=`$SQLCMD -S "${DB_SRV}" -U "${DB_USR}" -P"${DB_PWD}" -i $1`
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[compile_object] ERROR: ${SQLCMD} returned ${ret_code}"
+		print_and_log "${res}"
+		return 2
+	fi
+	
+	check_database_error "${res}"
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[compile_object] ERROR: an error occurred while compiling the object"
+		print_and_log "${res}"
+		return ${FATAL_ERROR}
+	fi
+	
+	return 0
+}
+
+function process_file()
+{
+	if [ ! -f "$1" ]
+	then
+		print_and_log "[process_file] ERROR: the '$1' does not exist"
+		return 1
+	fi
+	
+	# extract the object name
+	extract_obj_name "$1"
+	ret_code=$?
+	
+	if [ $ret_code -ne 0 ]
+	then
+		print_and_log "[process_file] ERROR: extract_obj_name returned ${ret_code}"
+		return 2
+	fi
+	
+	print_and_log "Processing file '$1' (${CURR_TYPELONG} '${CURR_OBJ}')..."
+	
+	# check if the object exists
+	does_object_exist "${CURR_TYPESHORT}" "${CURR_OBJ}"
+	ret_code=$?
+	
+	if [ $ret_code -gt 1	]
+	then
+		if [ $ret_code -eq ${FATAL_ERROR} ]
+		then
+			print_and_log "[process_file] FATAL: does_object_exist returned ${ret_code}"
+			delete_temp_files
+			exit 3
+		fi
+		
+		print_and_log "[process_file] ERROR: does_object_exist returned ${ret_code}"
+		return 3
+	fi
+	
+	if [ $ret_code -ne 0 ]
+	then
+		# drop the object
+		drop_object "${CURR_TYPELONG}" "${CURR_OBJ}"
+		ret_code=$?
+	
+		if [ $ret_code -ne 0 ]
+		then
+			if [ $ret_code -eq ${FATAL_ERROR} ]
+			then
+				print_and_log "[process_file] FATAL: drop_object returned ${ret_code}"
+				delete_temp_files
+				exit 4
+			fi
+				
+			print_and_log "[process_file] ERROR: drop_object returned ${ret_code}"
+			return 4
+		fi
+	fi
+	
+	# compile the object using the given script
+	compile_object $1
+	ret_code=$?
+	
+	if [ $ret_code -ne 0	]
+	then
+		if [ $ret_code -eq ${FATAL_ERROR} ]
+		then
+			print_and_log "[process_file] FATAL: compile_object returned ${ret_code}"
+			delete_temp_files
+			exit 5
+		fi
+		
+		print_and_log "[process_file] ERROR: compile_object returned ${ret_code}"
+		return 5
+	fi
+	
+	# check that the object has been compiled
+	does_object_exist "${CURR_TYPESHORT}" "${CURR_OBJ}"
+	ret_code=$?
+	
+	if [ $ret_code -gt 1	]
+	then
+		if [ $ret_code -eq ${FATAL_ERROR} ]
+		then
+			print_and_log "[process_file] FATAL: does_object_exist returned ${ret_code}"
+			delete_temp_files
+			exit 6
+		fi
+			
+		print_and_log "[process_file] ERROR: does_object_exist returned ${ret_code}"
+		return 6
+	fi
+	
+	if [ $ret_code -ne 1 ]
+	then
+		print_and_log "[process_file] ERROR: the object has not been created"
+		return 7
+	fi
+	
+	return 0
+}
+
+# parse command line args
+if [ $# -lt 3 ]
+then
+	usage
+fi
+
+while getopts s:u:p:d:l:en o
+do
+	case "$o" in
+		s) DB_SRV="$OPTARG";;
+		u) DB_USR="$OPTARG";;
+		p) DB_PWD="$OPTARG";;
+		d) DB_DATABASE="$OPTARG";;
+		l) DB_FILE="$OPTARG";;
+		e) USE_LOG=1;;
+		n) DROP_OBJECTS=0;;
+		*) usage;;
+	esac
+done
+shift `expr $OPTIND - 1`
+
+# check args
+if [ "x${DB_SRV}" = "x" ]
+then
+	echo "ERROR: you need to specify the server url"
+	exit 1
+fi
+
+if [ "x${DB_USR}" = "x" ]
+then
+	echo "ERROR: you need to specify the user name"
+	exit 1
+fi
+
+if [ "x${DB_PWD}" = "x" ]
+then
+	echo "ERROR: you need to specify the user password"
+	exit 1
+fi
+
+if [ "x${DB_FILE}" != "x" ] && [ ! -f ${DB_FILE} ]
+then
+	echo "ERROR: specified file list does not exist"
+	exit 1
+fi
+
+if [ "x${DB_DATABASE}" = "x" ]
+then
+	echo "WARNING: using default database ('CodaSwift')"
+	DB_DATABASE="CodaSwift"
+fi
+
+
+echo ""
+print_and_log "${PROGNAME} v${PROGVERSION} starting..."
+
+if [ $USE_LOG -ne 0 ]
+then
+	print_and_log "Log File: ${LOGFILE}"
+fi
+
+print_and_log "Database Server: ${DB_SRV}"
+print_and_log "Database User: ${DB_USR}"
+print_and_log "Database: ${DB_DATABASE}"
+print_and_log "File list: ${DB_FILE}"
+print_and_log "Use logs: ${USE_LOG}"
+print_and_log "Drop objects: ${DROP_OBJECTS}"
+print_and_log ""
+
+
+# check connexion
+check_connection
+ret_code=$?
+
+if [ $ret_code -ne 0 ]
+then
+	print_and_log "ERROR: an error occurred while checking database connexion"
+	delete_temp_files
+	exit 1
+fi
+
+
+if [ "x${DB_FILE}" != "x" ] 
+then
+	cat ${DB_FILE} | while read i;
+	do
+		if [ "x${i}" != "x" ]
+		then
+			process_file "${i}"
+		fi
+	done
+else
+	if [ $# -lt 1 ]
+	then
+		print_and_log "ERROR: you must specify what file(s) must be processed"
+		delete_temp_files
+		exit 1
+	fi
+	
+	for i in $*
+	do
+		process_file "${i}"
+	done
+fi
+
+#clean up
+delete_temp_files
